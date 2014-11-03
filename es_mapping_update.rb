@@ -21,6 +21,7 @@ MAX_JOBS_COUNT = 25
         log(:warning, "WARNING: #{e.inspect} - retrying in 10 seconds")
         log(:warning, e.backtrace.join("\n"))
         sleep(10)
+        Cassini::Email.client.transport.reload_connections!
         with_retry do
           block.call
         end
@@ -36,7 +37,6 @@ MAX_JOBS_COUNT = 25
   def create_index(name)
     log(:info, "create_index(#{name})")
     with_retry do
-      puts "\ncreate_index #{name}"
       Cassini::Email.create!(name)
       Chewy.wait_for_status
     end
@@ -57,6 +57,7 @@ MAX_JOBS_COUNT = 25
     log(:info, "client.indices.delete_alias(name: #{name}, index: #{index})")
     with_retry do
       begin
+        puts "deleting alias #{name}, index: #{index}"
         client.indices.delete_alias(name: name, index: index)
         Chewy.wait_for_status
       rescue Elasticsearch::Transport::Transport::Errors::NotFound
@@ -75,6 +76,7 @@ MAX_JOBS_COUNT = 25
   def wait_or_bail(process_ids, flags=0)
     begin
       pid, status = Process.wait2(-1, flags)
+      puts "PID - #{pid}\tExit status - #{status}"
     rescue Errno::ECHILD
       return nil
     end
@@ -83,12 +85,14 @@ MAX_JOBS_COUNT = 25
       log(:info, "Child failed: #{status.inspect} -- Bailing!")
       exit(1)
     end
+    puts "Deleting process #{pid}"
     process_ids.delete(pid)
     return pid
   end
 
   def reap(process_ids)
     if process_ids.size >= MAX_JOBS_COUNT
+      puts "number of active process #{process_ids.length}"
       wait_or_bail(process_ids)
     end
     while wait_or_bail(process_ids, Process::WNOHANG); end
@@ -100,6 +104,7 @@ MAX_JOBS_COUNT = 25
 
   def copy_index(src, dst)
     log(:info, "copy_index(#{src}, #{dst})")
+    puts "\ncopy_index(#{src}, #{dst}) - PID #{Process.pid}\n"
     r = client.search(
         index:       src,
         search_type: 'scan',
@@ -118,6 +123,7 @@ MAX_JOBS_COUNT = 25
             }
           end
       )
+      puts "Copying -  #{Process.pid}"
     end
   end
 
@@ -125,11 +131,16 @@ MAX_JOBS_COUNT = 25
     job('es-mapping-update')do
       #Get all indexes
       old_indexes = Cassini::Email.indexes.sort
-      puts "Old indexes #{old_indexes}"
       new_indexes = []
       # Create a new index for writing while this runs.  We will read from
       # all data *other* than this via old alias, but include this data in
       # the overall 'emails' dataset.
+      old_alias   = 'old_emails'
+      delete_alias(old_alias, '*')
+
+      Cassini::Email.indexes.each do |index|
+        put_alias(old_alias, index)
+      end
 
       Cassini::Email.create_new_writer_index
       Cassini::Email.client.transport.reload_connections!
@@ -151,39 +162,42 @@ MAX_JOBS_COUNT = 25
         new_indexes << index
       end
 
-      puts "New indexes #{new_indexes}"
       new_indexes.uniq!
       log(:info, "Creating new indexes.\n #{new_indexes.uniq} ")
-      #Now start copying one by one
 
       puts "Creating new indexes.\n #{new_indexes} "
+      new_indexes.each do |new_index|
+        ActiveRecord::Base.establish_connection
+        Cassini::Email.client.transport.reload_connections!
+        create_index(new_index.split('_').last)
+        puts "\nCreated "+new_index
+      end
+
       log(:info, "Copying new old data to new indexes")
       process_ids = []
       (0..new_indexes.length-1).each do |i|
         pid = fork do
          begin
-            ActiveRecord::Base.establish_connection
+            #ActiveRecord::Base.establish_connection
             Cassini::Email.client.transport.reload_connections!
-            create_index(new_indexes[i].split('_').last)
-            puts "\n*****Created "+new_indexes[i]
             copy_index(old_indexes[i], new_indexes[i])
-            puts "\n******Copied!"
+            puts "\nCopied!\t-\tPID #{Process.pid}"
+            delete_index(old_indexes[i])
+            puts "\nIndex deleted! #{old_indexes[i]}\t-\tPID #{Process.pid}"
           ensure
             exit
          end
-        process_ids << pid
-        puts "Process ids size #{process_ids.length}"
-        #log(:info, "Forked pid=#{pid} to copy #{new_indexes[i]} index.")
-
-        reap(process_ids)
         end
+        process_ids << pid
+        puts "\n\nForked pid=#{pid} to copy #{new_indexes[i]} index."
+        #log(:info, "Forked pid=#{pid} to copy #{new_indexes[i]} index.")
+        reap(process_ids)
       end
-
-      #Process.waitall
+      puts "# of processes #{process_ids.length}"
       #log(:info, "Finished forking workers to populate new index partitions.  Waiting for them to finish.")
       puts "Finished forking workers to populate new index partitions.  Waiting for them to finish."
       reap_all(process_ids)
-
+      Process.waitall
       # Connections may have gotten stale by now.
       client.transport.reload_connections!
       ActiveRecord::Base.establish_connection
@@ -194,12 +208,13 @@ MAX_JOBS_COUNT = 25
 
       log(:debug, "Creating new aliases.")
       puts "Creating new aliases"
-
+      sleep(5)
       # create new aliases
       new_indexes.each do |new_index|
         put_alias(index_name, new_index)
       end
-
+      puts  "put a new alias"
+      sleep(3)
       put_alias(index_name, new_writer_index)
       log(:debug, "Done.")
       puts "DONE"
